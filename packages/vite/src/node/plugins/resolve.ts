@@ -221,10 +221,59 @@ const perEnvironmentOrWorkerPlugin = (
   ]
 }
 
+/**
+ * Rolldown will follow symlinks and escape the Bazel sandbox. This function attempts
+ * to detect when this has happened and patches resolution back into the sandbox.
+ *
+ * See: https://github.com/aspect-build/rules_js/blob/dc0205c7b35c09c33f3942f23fa125c87c76ed17/js/private/node-patches/fs.cjs
+ */
+function bazelSandboxRemap(resolvedId: string): string {
+  const execroot = process.env.JS_BINARY__EXECROOT
+  if (execroot == null) {
+    return resolvedId
+  }
+
+  const bindir = process.env.BAZEL_BINDIR
+  if (bindir == null) {
+    return resolvedId
+  }
+
+  // When running under runfiles (e.g. `bazel test`), remap to the runfiles
+  // tree. Otherwise (e.g. `bazel build`), remap to the sandbox execroot.
+  const runUnderRunfiles = process.env.RUN_UNDER_RUNFILES === '1'
+  const sandboxDir = runUnderRunfiles
+    ? normalizePath(
+        path.join(
+          process.env.JS_BINARY__RUNFILES!,
+          process.env.JS_BINARY__WORKSPACE!,
+        ),
+      )
+    : normalizePath(execroot)
+
+  if (resolvedId.startsWith(sandboxDir)) {
+    return resolvedId
+  }
+
+  // Use BAZEL_BINDIR as the anchor to find where the path escaped.
+  // Everything after it is the package-relative path.
+  const idx = resolvedId.indexOf(bindir)
+  if (idx === -1) {
+    return resolvedId
+  }
+
+  const relative = resolvedId.slice(idx + bindir.length)
+  // The runfiles tree doesn't have the BAZEL_BINDIR prefix.
+  return runUnderRunfiles
+    ? path.join(sandboxDir, relative)
+    : path.join(sandboxDir, bindir, relative)
+}
+
 export function oxcResolvePlugin(
   resolveOptions: ResolvePluginOptionsWithOverrides,
   overrideEnvConfig: (ResolvedConfig & ResolvedEnvironmentOptions) | undefined,
 ): Plugin[] {
+  const isBazelSandbox = process.env.JS_BINARY__EXECROOT != null
+
   return [
     ...(resolveOptions.optimizeDeps && !resolveOptions.isBuild
       ? [optimizerResolvePlugin(resolveOptions)]
@@ -290,67 +339,81 @@ export function oxcResolvePlugin(
             // eslint-disable-next-line eqeqeq
             partialEnv.config.server.watch === null,
           legacyInconsistentCjsInterop: options.legacyInconsistentCjsInterop,
-          finalizeBareSpecifier: !depsOptimizerEnabled
-            ? undefined
-            : (resolvedId, rawId, importer) => {
-                const depsOptimizer = getDepsOptimizer()
-                // if we reach here, it's a valid dep import that hasn't been optimized.
-                const isJsType = isOptimizable(
-                  resolvedId,
-                  depsOptimizer.options,
-                )
-                const exclude = depsOptimizer?.options.exclude
-
-                // check for deep import, e.g. "my-lib/foo"
-                const deepMatch = deepImportRE.exec(rawId)
-                // package name doesn't include postfixes
-                // trim them to support importing package with queries (e.g. `import css from 'normalize.css?inline'`)
-                const pkgId = deepMatch
-                  ? deepMatch[1] || deepMatch[2]
-                  : cleanUrl(rawId)
-
-                const skipOptimization =
-                  depsOptimizer.options.noDiscovery ||
-                  !isJsType ||
-                  (importer && isInNodeModules(importer)) ||
-                  exclude?.includes(pkgId) ||
-                  exclude?.includes(rawId) ||
-                  SPECIAL_QUERY_RE.test(resolvedId)
-
-                let newId = resolvedId
-                if (skipOptimization) {
-                  // excluded from optimization
-                  // Inject a version query to npm deps so that the browser
-                  // can cache it without re-validation, but only do so for known js types.
-                  // otherwise we may introduce duplicated modules for externalized files
-                  // from pre-bundled deps.
-                  const versionHash = depsOptimizer!.metadata.browserHash
-                  if (versionHash && isJsType) {
-                    newId = injectQuery(newId, `v=${versionHash}`)
+          finalizeBareSpecifier:
+            !isBazelSandbox && !depsOptimizerEnabled
+              ? undefined
+              : (resolvedId, rawId, importer) => {
+                  resolvedId = bazelSandboxRemap(resolvedId)
+                  if (!depsOptimizerEnabled) {
+                    return resolvedId
                   }
-                } else {
-                  // this is a missing import, queue optimize-deps re-run and
-                  // get a resolved its optimized info
-                  const optimizedInfo = depsOptimizer!.registerMissingImport(
-                    rawId,
-                    newId,
+
+                  const depsOptimizer = getDepsOptimizer()
+                  // if we reach here, it's a valid dep import that hasn't been optimized.
+                  const isJsType = isOptimizable(
+                    resolvedId,
+                    depsOptimizer.options,
                   )
-                  newId = depsOptimizer!.getOptimizedDepId(optimizedInfo)
-                }
-                return newId
-              },
-          finalizeOtherSpecifiers: !depsOptimizerEnabled
-            ? undefined
-            : (resolvedId, rawId) => {
-                const depsOptimizer = getDepsOptimizer()
-                const newResolvedId = ensureVersionQuery(
-                  resolvedId,
-                  rawId,
-                  options,
-                  depsOptimizer,
-                )
-                return newResolvedId === resolvedId ? undefined : newResolvedId
-              },
+                  const exclude = depsOptimizer?.options.exclude
+
+                  // check for deep import, e.g. "my-lib/foo"
+                  const deepMatch = deepImportRE.exec(rawId)
+                  // package name doesn't include postfixes
+                  // trim them to support importing package with queries (e.g. `import css from 'normalize.css?inline'`)
+                  const pkgId = deepMatch
+                    ? deepMatch[1] || deepMatch[2]
+                    : cleanUrl(rawId)
+
+                  const skipOptimization =
+                    depsOptimizer.options.noDiscovery ||
+                    !isJsType ||
+                    (importer && isInNodeModules(importer)) ||
+                    exclude?.includes(pkgId) ||
+                    exclude?.includes(rawId) ||
+                    SPECIAL_QUERY_RE.test(resolvedId)
+
+                  let newId = resolvedId
+                  if (skipOptimization) {
+                    // excluded from optimization
+                    // Inject a version query to npm deps so that the browser
+                    // can cache it without re-validation, but only do so for known js types.
+                    // otherwise we may introduce duplicated modules for externalized files
+                    // from pre-bundled deps.
+                    const versionHash = depsOptimizer!.metadata.browserHash
+                    if (versionHash && isJsType) {
+                      newId = injectQuery(newId, `v=${versionHash}`)
+                    }
+                  } else {
+                    // this is a missing import, queue optimize-deps re-run and
+                    // get a resolved its optimized info
+                    const optimizedInfo = depsOptimizer!.registerMissingImport(
+                      rawId,
+                      newId,
+                    )
+                    newId = depsOptimizer!.getOptimizedDepId(optimizedInfo)
+                  }
+                  return newId
+                },
+          finalizeOtherSpecifiers:
+            !isBazelSandbox && !depsOptimizerEnabled
+              ? undefined
+              : (resolvedId, rawId) => {
+                  resolvedId = bazelSandboxRemap(resolvedId)
+                  if (!depsOptimizerEnabled) {
+                    return resolvedId
+                  }
+
+                  const depsOptimizer = getDepsOptimizer()
+                  const newResolvedId = ensureVersionQuery(
+                    resolvedId,
+                    rawId,
+                    options,
+                    depsOptimizer,
+                  )
+                  return newResolvedId === resolvedId
+                    ? undefined
+                    : newResolvedId
+                },
           resolveSubpathImports(id, importer, isRequire, scan) {
             return resolveSubpathImports(id, importer, {
               ...options,

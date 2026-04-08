@@ -2,7 +2,7 @@ import { pathToFileURL } from 'node:url'
 import type { FetchResult } from 'vite/module-runner'
 import type { EnvironmentModuleNode, TransformResult } from '..'
 import { tryNodeResolve } from '../plugins/resolve'
-import { isBuiltin, isExternalUrl, isFilePathESM } from '../utils'
+import { fsPathFromId, isBuiltin, isExternalUrl, isFilePathESM } from '../utils'
 import { unwrapId } from '../../shared/utils'
 import {
   MODULE_RUNNER_SOURCEMAPPING_SOURCE,
@@ -27,6 +27,11 @@ export async function fetchModule(
   importer?: string,
   options: FetchModuleOptions = {},
 ): Promise<FetchResult> {
+  // Strip /@fs/ URL prefix to get real filesystem path (Bazel sandbox compatibility)
+  if (url.startsWith('/@fs/')) {
+    url = fsPathFromId(url)
+  }
+
   if (
     url.startsWith('data:') ||
     isBuiltin(environment.config.resolve.builtins, url)
